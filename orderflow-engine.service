@@ -1,0 +1,31 @@
+[Unit]
+Description=Institutional Order Flow & Footprint Delta Engine (BTCUSD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/orderflow
+# Credentials are read from the environment only. Prefer an EnvironmentFile
+# with mode 0600 over inlining secrets here. The '-' makes a missing file
+# non-fatal so the engine still boots in PAPER mode without keys.
+EnvironmentFile=-/etc/orderflow/orderflow.env
+# Optional: serve the live dashboard (0 = off)
+Environment=DASHBOARD_PORT=8080
+ExecStart=/usr/bin/python3 /opt/orderflow/orderflow_engine.py --watchdog --stats-interval 30 --min-premium 200 --max-premium 400 --premium-take-profit-pct 0.5 --max-open-positions 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+# Logs: the engine writes orderflow_engine.log itself (FileHandler); systemd
+# captures stdout/stderr into the journal for journalctl -u orderflow-engine.
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/orderflow
+
+[Install]
+WantedBy=multi-user.target

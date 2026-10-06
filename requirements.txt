@@ -1,0 +1,5 @@
+aiohttp>=3.9
+websockets>=12.0
+# Optional: the transport used in Delta's own docs examples (import websocket).
+# The engine uses `websockets`; install this if you want to run Delta's snippets.
+websocket-client>=1.6

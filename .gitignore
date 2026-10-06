@@ -1,0 +1,10 @@
+# Engine runtime state and logs (never commit live state or credentials)
+orderflow_state.db
+orderflow_state.db-wal
+orderflow_state.db-shm
+state.json
+*.heartbeat
+*.log
+*.env
+__pycache__/
+*.pyc

@@ -1,0 +1,14 @@
+[Unit]
+Description=Public tunnel for the order flow engine dashboard (Cloudflare)
+After=network-online.target orderflow-engine.service
+Wants=network-online.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/opt/orderflow
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate --logfile /opt/orderflow/tunnel.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
