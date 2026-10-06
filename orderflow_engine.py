@@ -52,7 +52,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
@@ -88,8 +88,12 @@ log = logging.getLogger("orderflow")
 @dataclass
 class Config:
     # market
-    symbol: str = "BTCUSD"
+    symbol: str = "BTCUSD"           # primary symbol (kept for backward compat)
     asset: str = "BTC"
+    # multi-asset watchlist: every symbol gets its own footprint, its own
+    # 40-bar rolling sigma window and its own delta_samples rows, so BTC and
+    # XAUT never contaminate each other's trigger.
+    symbols: tuple = ("BTCUSD", "XAUTUSD")
     timeframes: tuple = ("1m", "3m", "5m")
     execution_tf: str = "1m"
 
@@ -309,6 +313,7 @@ class Signal:
     mean: float = 0.0        # rolling mean of |delta|
     sigma: float = 0.0       # rolling standard deviation of |delta|
     samples: int = 0         # closed bars behind the dynamic threshold
+    symbol: str = ""         # underlying this signal fired on (multi-asset)
 
 
 # ---------------------------------------------------------------------------
@@ -324,11 +329,13 @@ class DeltaFilter:
     """
 
     def __init__(self, window: int = 40, sigma_mult: float = 2.0,
-                 min_bars: int = 10, fallback_sigma: float = 400.0):
+                 min_bars: int = 10, fallback_sigma: float = 400.0,
+                 symbol: str = ""):
         self.window = window
         self.sigma_mult = sigma_mult
         self.min_bars = min_bars
         self.fallback_sigma = fallback_sigma
+        self.symbol = symbol      # owning underlying; routes samples to its table
         self.samples: deque = deque(maxlen=window)
 
     def add_bar(self, abs_delta: float) -> None:
@@ -422,6 +429,16 @@ CREATE TABLE IF NOT EXISTS engine_events (
     detail TEXT
 );
 CREATE TABLE IF NOT EXISTS delta_samples (
+    bar_start INTEGER PRIMARY KEY,
+    tf        TEXT NOT NULL,
+    abs_delta REAL NOT NULL,
+    delta     REAL NOT NULL,
+    mean      REAL,
+    sigma     REAL,
+    threshold REAL,
+    ts        INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS xaut_delta_samples (
     bar_start INTEGER PRIMARY KEY,
     tf        TEXT NOT NULL,
     abs_delta REAL NOT NULL,
@@ -571,19 +588,27 @@ class Ledger:
         )
 
     # -- rolling delta samples --------------------------------------------
+    @staticmethod
+    def _sample_table(symbol: str) -> str:
+        """XAUT gets its own table so gold's price/volume scale never leaks
+        into BTC's 40-bar sigma window (and vice versa)."""
+        return "xaut_delta_samples" if str(symbol).upper().startswith("XAUT") else "delta_samples"
+
     def record_delta_sample(self, bar_start: int, tf: str, delta: float,
-                            mean: float, sigma: float, threshold: float) -> None:
+                            mean: float, sigma: float, threshold: float,
+                            symbol: str = "BTCUSD") -> None:
         self._exec(
-            """INSERT OR REPLACE INTO delta_samples
+            f"""INSERT OR REPLACE INTO {self._sample_table(symbol)}
                (bar_start, tf, abs_delta, delta, mean, sigma, threshold, ts)
                VALUES (?,?,?,?,?,?,?,?)""",
             (bar_start, tf, abs(delta), delta, mean, sigma, threshold, now_ms()),
         )
 
-    def recent_delta_samples(self, tf: str, limit: int) -> list:
+    def recent_delta_samples(self, tf: str, limit: int, symbol: str = "BTCUSD") -> list:
         cur = self.conn.execute(
-            "SELECT abs_delta FROM delta_samples WHERE tf=? ORDER BY bar_start DESC LIMIT ?",
-            (tf, limit),
+            f"SELECT abs_delta FROM {self._sample_table(symbol)} "
+            "WHERE tf=? ORDER BY bar_start DESC LIMIT ?",
+            (tf, int(limit)),
         )
         rows = [r["abs_delta"] for r in cur.fetchall()]
         rows.reverse()   # oldest -> newest
@@ -775,6 +800,7 @@ class Strategy:
             sigma_mult=cfg.delta_sigma_mult,
             min_bars=cfg.rolling_min_bars,
             fallback_sigma=cfg.rolling_fallback_sigma,
+            symbol=cfg.symbol,
         )
 
     def _bar_for(self, tf: str, ts: int, tick_size: float) -> FootprintBar:
@@ -859,7 +885,8 @@ class Strategy:
         else:
             note = (f"{direction} | |delta| {abs(d):.0f} >= static {threshold:.0f}")
         return Signal(direction, d, bar.close, bar.start_ms + 1, bar.bull_stack,
-                      bar.bear_stack, bar.tf, note, threshold, mean, sigma, n)
+                      bar.bear_stack, bar.tf, note, threshold, mean, sigma, n,
+                      self.cfg.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -975,9 +1002,10 @@ def select_contract(products: list, underlying: float, contract_type: str, cfg: 
 # Market data feed (WebSocket)
 # ---------------------------------------------------------------------------
 class MarketFeed:
-    def __init__(self, cfg: Config, engine: "Engine"):
+    def __init__(self, cfg: Config, engine: "Engine", symbols: Optional[tuple] = None):
         self.cfg = cfg
         self.engine = engine
+        self.symbols = tuple(symbols) if symbols else tuple(cfg.symbols or (cfg.symbol,))
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -1002,19 +1030,21 @@ class MarketFeed:
     async def _session(self) -> None:
         if ws_connect is None:
             raise RuntimeError("websockets library unavailable")
+        # Subscribe BTC and XAUT on the same compact feed; each trade carries its
+        # own ``sy`` symbol so the engine can route it to the right footprint.
         sub = {
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "trades", "symbols": [self.cfg.symbol]},
-                    {"name": "mark_price", "symbols": [f"MARK:{self.cfg.symbol}"]},
+                    {"name": "trades", "symbols": list(self.symbols)},
+                    {"name": "mark_price", "symbols": [f"MARK:{s}" for s in self.symbols]},
                 ]
             },
         }
         async with ws_connect(self.cfg.ws_url, ping_interval=self.cfg.ws_heartbeat,
                               ping_timeout=self.cfg.ws_heartbeat, max_size=2 ** 22) as ws:
             await ws.send(json.dumps(sub))
-            log.info("feed connected: %s", self.cfg.ws_url)
+            log.info("feed connected: %s | symbols=%s", self.cfg.ws_url, ",".join(self.symbols))
             self.engine.on_feed_up()
             async for raw in ws:
                 if self._stop.is_set():
@@ -1059,7 +1089,11 @@ class MarketFeed:
             aggressor = None
         if not price or not size or aggressor is None:
             return
-        self.engine.on_trade(price, size, aggressor, ts)
+        # Route the trade to its own underlying. The compact feed carries the
+        # symbol in ``sy`` (BTCUSD / XAUTUSD); fall back to cfg.symbol for
+        # single-symbol payloads that omit it.
+        symbol = t.get("sy") or t.get("symbol") or self.cfg.symbol
+        self.engine.on_trade(price, size, aggressor, ts, symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -1069,7 +1103,16 @@ class Engine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.ledger = Ledger(cfg.state_db, cfg.state_json)
-        self.strategy = Strategy(cfg, on_bar_close=self._on_rolling_bar)
+        # One isolated Strategy per symbol: each keeps its own footprint bars,
+        # its own 40-bar rolling sigma window and its own trigger. BTC and XAUT
+        # never share state, so gold's price/volume scale cannot move BTC's gate.
+        self.symbols: tuple = tuple(dict.fromkeys(cfg.symbols or (cfg.symbol,)))
+        self.strategies: dict = {
+            sym: Strategy(replace(cfg, symbol=sym), on_bar_close=self._on_rolling_bar)
+            for sym in self.symbols
+        }
+        # Backward-compatible alias for the primary symbol.
+        self.strategy = self.strategies.get(cfg.symbol) or next(iter(self.strategies.values()))
         self.session: Optional["aiohttp.ClientSession"] = None
         self.rest: Optional[DeltaREST] = None
         self.broker: Optional[Broker] = None
@@ -1081,10 +1124,12 @@ class Engine:
         # runs under asyncio.run().
         self._stop_event: Optional[asyncio.Event] = None
         self._exec_lock_obj: Optional[asyncio.Lock] = None
-        self._tick_size = 0.5
-        self._mark_price: float = 0.0
+        self._tick_size = 0.5                       # primary symbol (compat)
+        self._mark_price: float = 0.0               # primary symbol (compat)
+        self._ticks: dict = {sym: 0.5 for sym in self.symbols}
+        self._marks: dict = {sym: 0.0 for sym in self.symbols}
         self._open: dict = {}          # uid -> position dict
-        self._chain_cache: dict = {}   # contract_type -> (ts, [products])
+        self._chain_cache: dict = {}   # (symbol, contract_type) -> (ts, [products])
         self._signals: deque = deque(maxlen=100)
         self._dash_runner = None
 
@@ -1101,10 +1146,17 @@ class Engine:
         return self._exec_lock_obj
 
     def _on_rolling_bar(self, bar, delta_filter) -> None:
-        """Persist every closed rolling bar so the sigma window survives restarts."""
+        """Persist every closed rolling bar so the sigma window survives restarts.
+
+        The bar's ``tf`` is used as the key and the owning symbol is recovered
+        from the strategy that produced it via the filter's bound config, so
+        XAUT bars land in ``xaut_delta_samples`` and BTC bars in
+        ``delta_samples``.
+        """
+        symbol = getattr(delta_filter, "symbol", None) or self.cfg.symbol
         mean, sigma, _ = delta_filter.stats()
         self.ledger.record_delta_sample(bar.start_ms, bar.tf, bar.delta, mean, sigma,
-                                        delta_filter.threshold())
+                                        delta_filter.threshold(), symbol)
         self.ledger.mirror(delta_filter.snapshot())
 
     # -- lifecycle ---------------------------------------------------------
@@ -1116,10 +1168,10 @@ class Engine:
         self.session = aiohttp.ClientSession()
         self.rest = DeltaREST(self.cfg, self.session, api_key, api_secret)
         self.broker = Broker(self.cfg, self.rest)
-        self.feed = MarketFeed(self.cfg, self)
+        self.feed = MarketFeed(self.cfg, self, symbols=self.symbols)
 
-        log.info("engine %s starting | mode=%s | symbol=%s",
-                 VERSION, "LIVE" if self.broker.live else "PAPER", self.cfg.symbol)
+        log.info("engine %s starting | mode=%s | symbols=%s",
+                 VERSION, "LIVE" if self.broker.live else "PAPER", ",".join(self.symbols))
 
         await self._load_market_meta()
         await self._recover()
@@ -1153,27 +1205,33 @@ class Engine:
         self._stop.set()
 
     async def _load_market_meta(self) -> None:
-        try:
-            prod = await self.rest.product(self.cfg.symbol)
-            self._tick_size = fnum(prod.get("tick_size"), 0.5) or 0.5
-        except Exception as exc:  # noqa: BLE001
-            log.warning("could not load %s metadata (%s); defaulting tick=0.5", self.cfg.symbol, exc)
-        log.info("tick size for %s = %s", self.cfg.symbol, self._tick_size)
+        for sym in self.symbols:
+            try:
+                prod = await self.rest.product(sym)
+                self._ticks[sym] = fnum(prod.get("tick_size"), 0.5) or 0.5
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not load %s metadata (%s); defaulting tick=0.5", sym, exc)
+            log.info("tick size for %s = %s", sym, self._ticks[sym])
+        self._tick_size = self._ticks.get(self.cfg.symbol, 0.5)
 
     # -- cold start recovery ----------------------------------------------
     async def _recover(self) -> None:
-        # restore the rolling sigma window first so the dynamic gate is armed
-        # immediately after a restart instead of waiting hours to warm up.
-        samples = self.ledger.recent_delta_samples(self.cfg.rolling_tf, self.cfg.rolling_window)
-        if samples:
-            self.strategy.filter.load(samples)
-            mean, sigma, n = self.strategy.filter.stats()
-            log.info("cold start: restored %d rolling %s delta samples | mean=%.1f sigma=%.1f "
-                     "threshold=%.1f armed=%s", n, self.cfg.rolling_tf, mean, sigma,
-                     self.strategy.filter.threshold(), self.strategy.filter.armed)
-        else:
-            log.info("cold start: no rolling delta history; dynamic gate warms up over "
-                     "%d closed %s bars", self.cfg.rolling_min_bars, self.cfg.rolling_tf)
+        # restore each symbol's rolling sigma window first so the dynamic gate
+        # is armed immediately after a restart instead of waiting hours to warm
+        # up. XAUT reads its own table, so the two windows never mix.
+        for sym, strat in self.strategies.items():
+            samples = self.ledger.recent_delta_samples(self.cfg.rolling_tf,
+                                                       self.cfg.rolling_window, sym)
+            if samples:
+                strat.filter.load(samples)
+                mean, sigma, n = strat.filter.stats()
+                log.info("cold start %s: restored %d rolling %s delta samples | mean=%.1f "
+                         "sigma=%.1f threshold=%.1f armed=%s", sym, n, self.cfg.rolling_tf,
+                         mean, sigma, strat.filter.threshold(), strat.filter.armed)
+            else:
+                log.info("cold start %s: no rolling delta history; dynamic gate warms up "
+                         "over %d closed %s bars", sym, self.cfg.rolling_min_bars,
+                         self.cfg.rolling_tf)
 
         restored = self.ledger.recent_events("signal", 100)
         for rec in restored:
@@ -1254,17 +1312,28 @@ class Engine:
 
     def on_ticker(self, msg: dict) -> None:
         mark = fnum(msg.get("mark_price", msg.get("p")))
+        # mark_price payloads carry the symbol as "MARK:<SYM>" (or "sy").
+        raw = msg.get("symbol") or msg.get("sy") or ""
+        sym = raw.split(":", 1)[1] if raw.startswith("MARK:") else raw
         if mark:
-            self._mark_price = mark
+            self._mark_price = mark                       # primary (compat)
+            if sym:
+                self._marks[sym] = mark
         self._write_heartbeat()
 
-    def on_trade(self, price: float, size: float, aggressor: str, ts: int) -> None:
+    def on_trade(self, price: float, size: float, aggressor: str, ts: int,
+                 symbol: Optional[str] = None) -> None:
         self._write_heartbeat()
-        signal = self.strategy.on_trade(price, size, aggressor, ts, self._tick_size)
+        sym = symbol or self.cfg.symbol
+        strat = self.strategies.get(sym)
+        if strat is None:
+            return
+        self._marks[sym] = price
+        signal = strat.on_trade(price, size, aggressor, ts, self._ticks.get(sym, self._tick_size))
         if signal is None:
             return
         record = {
-            "ts": now_ms(), "direction": signal.direction, "delta": signal.delta,
+            "ts": now_ms(), "symbol": sym, "direction": signal.direction, "delta": signal.delta,
             "price": signal.price, "threshold": signal.threshold, "mean": signal.mean,
             "sigma": signal.sigma, "samples": signal.samples, "tf": signal.tf,
             "note": signal.note,
@@ -1287,11 +1356,14 @@ class Engine:
 
     async def _execute(self, signal: Signal) -> None:
         cfg = self.cfg
+        symbol = signal.symbol or cfg.symbol
+        asset = self._asset_for(symbol)
         contract_type = "call_options" if signal.direction == "bearish" else "put_options"
-        chain = await self._get_chain(contract_type)
+        chain = await self._get_chain(symbol, contract_type)
         product = select_contract(chain, signal.price, contract_type, cfg)
         if product is None:
-            log.warning("no eligible %s strike for signal %s", contract_type, signal.direction)
+            log.warning("no eligible %s %s strike for signal on %s",
+                        asset, contract_type, symbol)
             return
         ticker = await self.rest.ticker(product["symbol"])
         premium = fnum(ticker.get("mark_price"))
@@ -1326,8 +1398,8 @@ class Engine:
             product_id=pos["product_id"], side="sell", qty=pos["qty"],
             price=premium, status="pending", detail=asdict(signal),
         )
-        log.info("SELL %s x%d @ %.4f (stop %.4f) | %s",
-                 pos["symbol"], cfg.option_qty, premium, stop_price, signal.note)
+        log.info("SELL %s [%s] x%d @ %.4f (stop %.4f) | %s",
+                 pos["symbol"], symbol, cfg.option_qty, premium, stop_price, signal.note)
 
         order = await self.broker.sell_option(product, cfg.option_qty, premium)
         fill = fnum(order.get("average_fill_price"), premium) or premium
@@ -1342,12 +1414,23 @@ class Engine:
         self._open[uid] = pos
         log.info("position open %s | fill=%.4f | stop=%.4f", uid, fill, pos["stop_price"])
 
-    async def _get_chain(self, contract_type: str) -> list:
-        cached = self._chain_cache.get(contract_type)
+    @staticmethod
+    def _asset_for(symbol: str) -> str:
+        """Map a watchlist symbol to its Delta option-chain asset prefix."""
+        s = str(symbol).upper()
+        if s.startswith("XAUT"):
+            return "XAUT"
+        if s.startswith("BTC"):
+            return "BTC"
+        return s.replace("USD", "").replace("USDT", "") or s
+
+    async def _get_chain(self, symbol: str, contract_type: str) -> list:
+        key = (symbol, contract_type)
+        cached = self._chain_cache.get(key)
         if cached and (time.time() - cached[0]) < 30:
             return cached[1]
-        chain = await self.rest.option_chain(self.cfg.asset, contract_type)
-        self._chain_cache[contract_type] = (time.time(), chain)
+        chain = await self.rest.option_chain(self._asset_for(symbol), contract_type)
+        self._chain_cache[key] = (time.time(), chain)
         return chain
 
     # -- risk monitor ------------------------------------------------------
@@ -1414,13 +1497,12 @@ class Engine:
                 self._open.pop(uid, None)
 
     # -- dashboard snapshot ------------------------------------------------
-    def snapshot(self) -> dict:
-        """Full live view of the tape, footprint, delta window and positions."""
-        cfg = self.cfg
-        flt = self.strategy.filter
+    def _symbol_view(self, sym: str) -> dict:
+        strat = self.strategies[sym]
+        flt = strat.filter
         mean, sigma, n = flt.stats()
         bars = {}
-        for tf, bar in self.strategy.bars.items():
+        for tf, bar in strat.bars.items():
             bars[tf] = {
                 "tf": tf, "start_ms": bar.start_ms, "open": bar.open,
                 "high": bar.high, "low": bar.low, "close": bar.close,
@@ -1429,30 +1511,52 @@ class Engine:
                 "matrix": bar.matrix(),
             }
         closed = []
-        for tf, hist in self.strategy.history.items():
+        for tf, hist in strat.history.items():
             closed.append({
                 "tf": tf,
                 "bars": [{"start_ms": b.start_ms, "close": b.close,
                           "delta": round(b.delta, 2)} for b in list(hist)[-120:]],
             })
         return {
+            "symbol": sym,
+            "mark_price": self._marks.get(sym, 0.0),
+            "tick_size": self._ticks.get(sym, 0.5),
+            "delta_filter": flt.snapshot(),
+            "threshold": flt.threshold(),
+            "armed": flt.armed,
+            "mean": mean, "sigma": sigma, "samples": n,
+            "bars": bars, "history": closed,
+        }
+
+    def snapshot(self) -> dict:
+        """Full live view of the tape, footprint, delta window and positions.
+
+        Flat fields keep the primary symbol's shape for backward compatibility;
+        ``symbols`` + ``per_symbol`` expose the isolated multi-asset windows.
+        """
+        cfg = self.cfg
+        primary = self._symbol_view(cfg.symbol)
+        per_symbol = {sym: self._symbol_view(sym) for sym in self.symbols}
+        return {
             "engine": "orderflow_engine",
             "version": VERSION,
             "now_ms": now_ms(),
             "mode": "LIVE" if (self.broker and self.broker.live) else "PAPER",
             "symbol": cfg.symbol,
+            "symbols": list(self.symbols),
+            "per_symbol": per_symbol,
             "execution_tf": cfg.execution_tf,
             "rolling_tf": cfg.rolling_tf,
-            "mark_price": self._mark_price,
-            "tick_size": self._tick_size,
-            "delta_filter": flt.snapshot(),
-            "threshold": flt.threshold(),
-            "armed": flt.armed,
-            "mean": mean,
-            "sigma": sigma,
-            "samples": n,
-            "bars": bars,
-            "history": closed,
+            "mark_price": primary["mark_price"],
+            "tick_size": primary["tick_size"],
+            "delta_filter": primary["delta_filter"],
+            "threshold": primary["threshold"],
+            "armed": primary["armed"],
+            "mean": primary["mean"],
+            "sigma": primary["sigma"],
+            "samples": primary["samples"],
+            "bars": primary["bars"],
+            "history": primary["history"],
             "signals": list(self._signals)[-50:],
             "open_positions": list(self._open.values()),
         }
@@ -1461,16 +1565,18 @@ class Engine:
     async def _stats_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                bar = self.strategy.bars.get(self.cfg.execution_tf)
-                if bar:
-                    flt = self.strategy.filter
+                for sym, strat in self.strategies.items():
+                    bar = strat.bars.get(self.cfg.execution_tf)
+                    if not bar:
+                        continue
+                    flt = strat.filter
                     mean, sigma, n = flt.stats()
-                    log.info("bar %s [%s] trades=%d delta=%.1f bull_stack=%d bear_stack=%d "
-                             "mark=%.2f open=%d | sigma-window n=%d mean=%.0f sigma=%.0f "
-                             "trigger=%.0f%s",
-                             bar.tf, datetime.fromtimestamp(bar.start_ms / 1000, timezone.utc)
+                    log.info("[%s] bar %s [%s] trades=%d delta=%.1f bull_stack=%d "
+                             "bear_stack=%d mark=%.2f open=%d | sigma-window n=%d mean=%.0f "
+                             "sigma=%.0f trigger=%.0f%s",
+                             sym, bar.tf, datetime.fromtimestamp(bar.start_ms / 1000, timezone.utc)
                              .strftime("%H:%M"), bar.trades, bar.delta, bar.bull_stack,
-                             bar.bear_stack, self._mark_price, len(self._open),
+                             bar.bear_stack, self._marks.get(sym, 0.0), len(self._open),
                              n, mean, sigma, flt.threshold(),
                              "" if flt.armed else " (warming up)")
             except Exception as exc:  # noqa: BLE001
@@ -1506,6 +1612,9 @@ def _engine_argv(args: argparse.Namespace) -> list:
     if args.live:
         argv.append("--live")
     argv += [
+        "--symbol", args.symbol,
+        "--asset", args.asset,
+        "--symbols", args.symbols,
         "--timeframes", args.timeframes,
         "--execution-tf", args.execution_tf,
         "--imbalance-multiple", str(args.imbalance_multiple),
@@ -1575,8 +1684,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--live", action="store_true", help="arm real order transmission (requires API keys)")
     p.add_argument("--watchdog", action="store_true", help="run as supervising parent process")
     p.add_argument("--max-restarts", type=int, default=0, help="watchdog restart budget (0 = unlimited)")
-    p.add_argument("--symbol", default="BTCUSD")
+    p.add_argument("--symbol", default="BTCUSD", help="primary symbol (dashboard/compat)")
     p.add_argument("--asset", default="BTC")
+    p.add_argument("--symbols", default="BTCUSD,XAUTUSD",
+                   help="comma-separated watchlist; each gets an isolated sigma window")
     p.add_argument("--timeframes", default="1m,3m,5m")
     p.add_argument("--execution-tf", default="1m", choices=list(TF_MS))
     p.add_argument("--imbalance-multiple", type=float, default=2.5)
@@ -1636,7 +1747,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
     if args.execution_tf not in tfs:
         tfs = tuple(dict.fromkeys((*tfs, args.execution_tf)))
     return Config(
-        symbol=args.symbol, asset=args.asset, timeframes=tfs, execution_tf=args.execution_tf,
+        symbol=args.symbol, asset=args.asset,
+        symbols=tuple(s.strip() for s in (args.symbols or args.symbol).split(",") if s.strip()),
+        timeframes=tfs, execution_tf=args.execution_tf,
         imbalance_multiple=args.imbalance_multiple,
         stacked_imbalances_required=args.stacked_imbalances,
         delta_block_threshold=args.delta_block_threshold,

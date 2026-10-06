@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from orderflow_engine import (Config, DeltaFilter, Engine, Ledger, Strategy,
+from orderflow_engine import (Config, DeltaFilter, Engine, Ledger, Signal, Strategy,
                               select_contract, to_ms)
 
 
@@ -348,6 +348,113 @@ class TestSignalRecovery(unittest.TestCase):
             restored = eng.ledger.recent_events("signal", 100)
             self.assertEqual(restored[0]["delta"], 1500.0)
             eng.ledger.close()
+
+
+class TestMultiAssetIsolation(unittest.TestCase):
+    """BTC and XAUT must keep fully separate sigma windows and sample tables."""
+
+    def _engine(self, d, symbols=("BTCUSD", "XAUTUSD")):
+        cfg = Config(symbols=symbols, state_db=os.path.join(d, "s.db"),
+                     state_json=os.path.join(d, "s.json"),
+                     rolling_tf="15m", rolling_window=40, rolling_min_bars=10)
+        eng = Engine(cfg)
+        eng.rest = _FakeREST(85000.0)
+        eng.broker = _FakeBroker()
+        return eng
+
+    def test_each_symbol_gets_isolated_strategy(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self._engine(d)
+            self.assertEqual(set(eng.strategies), {"BTCUSD", "XAUTUSD"})
+            self.assertIsNot(eng.strategies["BTCUSD"], eng.strategies["XAUTUSD"])
+            self.assertIsNot(eng.strategies["BTCUSD"].filter,
+                             eng.strategies["XAUTUSD"].filter)
+            # the primary alias still points at BTC
+            self.assertIs(eng.strategy, eng.strategies["BTCUSD"])
+            eng.ledger.close()
+
+    def test_xaut_samples_go_to_own_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self._engine(d)
+            for i in range(3):
+                eng.ledger.record_delta_sample(i, "15m", 100 + i, 0, 0, 0, "BTCUSD")
+                eng.ledger.record_delta_sample(i, "15m", 9000 + i, 0, 0, 0, "XAUTUSD")
+            btc = eng.ledger.recent_delta_samples("15m", 40, "BTCUSD")
+            xaut = eng.ledger.recent_delta_samples("15m", 40, "XAUTUSD")
+            self.assertEqual(btc, [100, 101, 102])
+            self.assertEqual(xaut, [9000, 9001, 9002])
+            # the legacy 2-arg call still reads the BTC table
+            self.assertEqual(eng.ledger.recent_delta_samples("15m", 40), btc)
+            eng.ledger.close()
+
+    def test_xaut_and_btc_have_independent_triggers(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self._engine(d)
+            # BTC window is quiet (|delta| ~100, tight spread); XAUT is huge and
+            # volatile (~9000 with a wide spread), so the 2-sigma triggers differ.
+            for i in range(10):
+                eng.strategies["BTCUSD"].filter.add_bar(100.0 + i)
+                eng.strategies["XAUTUSD"].filter.add_bar(9000.0 + i * 100)
+            btc_thr = eng.strategies["BTCUSD"].filter.threshold()
+            xaut_thr = eng.strategies["XAUTUSD"].filter.threshold()
+            self.assertGreater(xaut_thr, btc_thr * 10)
+            eng.ledger.close()
+
+    def test_trades_route_to_the_right_footprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self._engine(d)
+            ts = 1_700_000_000_000
+            eng.on_trade(85000.0, 1.0, "buy", ts, "BTCUSD")
+            eng.on_trade(4200.0, 5.0, "sell", ts, "XAUTUSD")
+            self.assertEqual(eng.strategies["BTCUSD"].bars["1m"].trades, 1)
+            self.assertEqual(eng.strategies["XAUTUSD"].bars["1m"].trades, 1)
+            self.assertEqual(eng.strategies["BTCUSD"].bars["1m"].close, 85000.0)
+            self.assertEqual(eng.strategies["XAUTUSD"].bars["1m"].close, 4200.0)
+            self.assertEqual(eng._marks["XAUTUSD"], 4200.0)
+            eng.ledger.close()
+
+    def test_snapshot_exposes_per_symbol_windows(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self._engine(d)
+            snap = eng.snapshot()
+            self.assertEqual(set(snap["per_symbol"]), {"BTCUSD", "XAUTUSD"})
+            self.assertEqual(snap["symbol"], "BTCUSD")
+            self.assertIn("delta_filter", snap["per_symbol"]["XAUTUSD"])
+            eng.ledger.close()
+
+    def test_asset_for_maps_symbols(self):
+        self.assertEqual(Engine._asset_for("XAUTUSD"), "XAUT")
+        self.assertEqual(Engine._asset_for("BTCUSD"), "BTC")
+
+    def test_xaut_signal_carries_symbol_and_routes_to_xaut_chain(self):
+        # A bearish XAUT signal must build a call chain for the XAUT asset, not BTC.
+        async def go():
+            with tempfile.TemporaryDirectory() as d:
+                eng = self._engine(d)
+                calls = []
+
+                class _Rest:
+                    async def option_chain(self, asset, ctype):
+                        calls.append((asset, ctype))
+                        return []
+                eng.rest = _Rest()
+                sig = Signal("bearish", -9000.0, 4200.0, 1, 0, 1, "1m",
+                             symbol="XAUTUSD")
+                await eng._execute(sig)
+                return calls
+        calls = asyncio.run(go())
+        self.assertEqual(calls, [("XAUT", "call_options")])
+
+    def test_engine_symbols_default_from_cfg(self):
+        # cfg.symbols overrides the primary; a single-symbol cfg still works.
+        cfg = Config(symbol="BTCUSD", symbols=("BTCUSD", "XAUTUSD"))
+        eng = Engine(cfg)
+        self.assertEqual(eng.symbols, ("BTCUSD", "XAUTUSD"))
+        cfg2 = Config(symbol="BTCUSD", symbols=())
+        eng2 = Engine(cfg2)
+        self.assertEqual(eng2.symbols, ("BTCUSD",))
+        eng.ledger.close()
+        eng2.ledger.close()
 
 
 class TestTimestampNormalization(unittest.TestCase):

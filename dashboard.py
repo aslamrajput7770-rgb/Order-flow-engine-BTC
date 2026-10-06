@@ -65,7 +65,7 @@ PAGE = r"""<!doctype html>
 <header>
   <h1>ORDER FLOW ENGINE</h1>
   <span id="mode" class="pill">-</span>
-  <span id="sym" class="pill">BTCUSD</span>
+  <select id="symsel" class="pill" style="background:var(--panel);color:var(--txt)"></select>
   <span id="tf" class="pill">-</span>
   <span id="clock" class="pill">-</span>
 </header>
@@ -89,7 +89,7 @@ PAGE = r"""<!doctype html>
   </div>
   <div class="card"><h2>Rolling window samples (|&delta;|)</h2><canvas id="win"></canvas></div>
   <div class="card"><h2>Signals</h2>
-    <div class="scroll"><table id="sig"><thead><tr><th>time</th><th>side</th><th>delta</th><th>trigger</th><th>price</th></tr></thead><tbody></tbody></table></div>
+    <div class="scroll"><table id="sig"><thead><tr><th>time</th><th>sym</th><th>side</th><th>delta</th><th>trigger</th><th>price</th></tr></thead><tbody></tbody></table></div>
   </div>
   <div class="card"><h2>Open positions</h2>
     <div class="scroll"><table id="pos"><thead><tr><th>symbol</th><th>qty</th><th>entry</th><th>stop</th><th>thr</th></tr></thead><tbody></tbody></table></div>
@@ -155,25 +155,37 @@ async function tick(){
     const r = await fetch("api/state",{cache:"no-store"});
     const s = await r.json();
     $("mode").textContent = s.mode; $("mode").className = "pill "+(s.mode==="LIVE"?"live":"paper");
-    $("sym").textContent = s.symbol; $("tf").textContent = s.execution_tf+" / win "+s.rolling_tf;
+
+    // populate the symbol selector once, preserving the user's choice
+    const sel = $("symsel");
+    if(sel.options.length !== (s.symbols||[]).length){
+      const keep = sel.value;
+      sel.innerHTML = "";
+      (s.symbols||[]).forEach(sym=>{ const o=document.createElement("option"); o.value=sym; o.textContent=sym; sel.appendChild(o); });
+      sel.value = keep || s.symbol;
+    }
+    const chosen = sel.value || s.symbol;
+    // per-symbol window when available; flat fields as the fallback (older shape)
+    const view = (s.per_symbol && s.per_symbol[chosen]) ? s.per_symbol[chosen] : s;
+    $("tf").textContent = s.execution_tf+" / win "+s.rolling_tf;
     $("clock").textContent = hhmm(s.now_ms);
-    $("mark").textContent = fmt(s.mark_price);
-    const b = s.bars[s.execution_tf] || {};
+    $("mark").textContent = fmt(view.mark_price);
+    const b = (view.bars||{})[s.execution_tf] || {};
     $("delta").textContent = fmt(b.delta);
     $("delta").style.color = (b.delta||0)>=0 ? "var(--up)" : "var(--down)";
-    $("thr").textContent = fmt(s.threshold,0);
-    $("mean").textContent = fmt(s.mean,0);
-    $("sigma").textContent = fmt(s.sigma,0);
-    $("samples").textContent = s.samples + "/" + s.delta_filter.window;
-    $("armed").textContent = s.armed ? "ARMED" : "warming";
-    $("armed").style.color = s.armed ? "var(--up)" : "var(--warn)";
+    $("thr").textContent = fmt(view.threshold,0);
+    $("mean").textContent = fmt(view.mean,0);
+    $("sigma").textContent = fmt(view.sigma,0);
+    $("samples").textContent = view.samples + "/" + (view.delta_filter||{}).window;
+    $("armed").textContent = view.armed ? "ARMED" : "warming";
+    $("armed").style.color = view.armed ? "var(--up)" : "var(--warn)";
     $("open").textContent = (s.open_positions||[]).length;
 
-    const exec = (s.history.find(h=>h.tf===s.execution_tf)||{}).bars || [];
+    const exec = ((view.history||[]).find(h=>h.tf===s.execution_tf)||{}).bars || [];
     drawLine($("px"), exec.map(x=>({x:x.start_ms,y:x.close})), "#4aa8ff", {});
-    drawBars($("dl"), exec.slice(-80), s.threshold);
-    drawLine($("win"), (s.delta_filter.recent||[]).map((v,i)=>({x:i,y:v})), "#ffb648",
-             {bands:[{v:s.threshold,color:"#7d8899",label:"2\u03c3 "+fmt(s.threshold,0)}], zero:0});
+    drawBars($("dl"), exec.slice(-80), view.threshold);
+    drawLine($("win"), ((view.delta_filter||{}).recent||[]).map((v,i)=>({x:i,y:v})), "#ffb648",
+             {bands:[{v:view.threshold,color:"#7d8899",label:"2\u03c3 "+fmt(view.threshold,0)}], zero:0});
 
     const tb = $("fp").querySelector("tbody"); tb.innerHTML = "";
     (b.matrix||[]).slice().reverse().forEach(row=>{
@@ -186,7 +198,8 @@ async function tick(){
     const sb = $("sig").querySelector("tbody"); sb.innerHTML="";
     (s.signals||[]).slice().reverse().forEach(g=>{
       const tr=document.createElement("tr");
-      tr.innerHTML=`<td>${hhmm(g.ts)}</td><td style="color:${g.direction==='bullish'?'var(--up)':'var(--down)'}">${g.direction}</td>`+
+      tr.innerHTML=`<td>${hhmm(g.ts)}</td><td>${g.symbol||s.symbol}</td>`+
+                   `<td style="color:${g.direction==='bullish'?'var(--up)':'var(--down)'}">${g.direction}</td>`+
                    `<td>${fmt(g.delta,0)}</td><td>${fmt(g.threshold,0)}</td><td>${fmt(g.price,1)}</td>`;
       sb.appendChild(tr);
     });
@@ -199,7 +212,7 @@ async function tick(){
       pb.appendChild(tr);
     });
 
-    $("foot").textContent = `engine ${s.version} | window n=${s.samples} mean=${fmt(s.mean,1)} sigma=${fmt(s.sigma,1)} trigger=${fmt(s.threshold,1)} | updated ${hhmm(s.now_ms)}`;
+    $("foot").textContent = `engine ${s.version} | view ${chosen} | window n=${view.samples} mean=${fmt(view.mean,1)} sigma=${fmt(view.sigma,1)} trigger=${fmt(view.threshold,1)} | updated ${hhmm(s.now_ms)}`;
   }catch(e){ $("foot").textContent = "no data: "+e; }
 }
 tick(); setInterval(tick, 1000);
